@@ -3,13 +3,15 @@ import os as os
 
 import imageio
 import numpy as numpy
-from scipy import ndimage
-from six.moves import cPickle as pickle
 import random as random
 import itertools as itertools
+from skimage.util import random_noise
+
 import tensorflow as tf
 import matplotlib.pyplot as plt
-import math as math
+from tensorflow.python.keras.layers import Add, Conv2D, Input, Lambda
+from tensorflow.python.keras.models import Model
+from skimage.transform import resize
 
 basePath = "./lfw/"
 numFaces = 50
@@ -19,22 +21,21 @@ def readSingleImage(fileName):
   return imageio.imread(fileName)
 
 
-def loadPicturesFromFiles(basePath):
-  allNames = os.listdir(basePath)[1:numFaces]
+def loadPicturesFromFiles(basePath, numFaces = numFaces, filter_names=None):
+  allNames = sorted(os.listdir(basePath))
+  allNames = allNames[1:numFaces] if numFaces > 0 else allNames
+  allNames = filter_names if filter_names else allNames
   allPictures = {}
   for personName in allNames:
     personPictureDirectory = os.path.join(basePath, personName)
     if (not (personName[0] == ".")) & os.path.isdir(personPictureDirectory):
       print("Reading faces of " + personName + "...", end="")
-      pictureFiles = os.listdir(personPictureDirectory)
+      pictureFiles = sorted(os.listdir(personPictureDirectory))
       pictureFiles = list(map(os.path.join, [personPictureDirectory] * len(pictureFiles), pictureFiles))
       pictures = list(map(readSingleImage, pictureFiles))
       print(" DONE (" + str(len(pictures)) + " read)")
       allPictures[personName] = pictures
   return allPictures
-
-allImagesDict = loadPicturesFromFiles(basePath)
-
 
 def splitImagesToTrainingAndTestingSets(allImagesDict, trainingPortion = 0.75):
   trainingImages = []
@@ -66,15 +67,13 @@ def expandAllImages(trainingImages, testingImages):
   return((trainingImages, testingImages))
 
 def zeroOneScaleColoursInImages(trainingImages, testingImages):
-  scale = numpy.vectorize(lambda x: x/255.0)
-  trainingImages = scale(numpy.array(trainingImages))
-  testingImages = scale(numpy.array(testingImages))
+  trainingImages = numpy.array(trainingImages) / 255.0
+  testingImages = numpy.array(testingImages) / 255.0
   return((trainingImages, testingImages))
 
 def backScaleColoursInImages(imageList):
-  scale = numpy.vectorize(lambda x: 0 if x < 0 else x*255 if x <= 1 else 255)
   imageList = numpy.array(imageList)
-  imageList = scale(imageList).astype(numpy.uint8)
+  imageList = numpy.clip(imageList*255, 0, 255).astype(numpy.uint8)
   return(imageList)
 
 
@@ -93,16 +92,123 @@ def showProgressOnTestingImages(inputTstImgs, outputTstImgs):
   plt.show()
 
 def addRandomNoiseToSingleImage(img, noiseLevel):
-  imageDimensions = img.shape
-  noise = numpy.random.rand(imageDimensions[0], imageDimensions[1], imageDimensions[2])
-  noiseIter = numpy.nditer([noise, None])
-  for i, out in noiseIter:
-    if i > noiseLevel:
-      out[...] = 1
-    else:
-      out[...] = 0
-  imageMask = noiseIter.operands[1]
-  return(img * imageMask)
+  noise_img = random_noise(img, mode='s&p', amount=noiseLevel)
+  return noise_img
 
 def addRandomNoiseToAllImages(allImages, noiseLevel):
-  return(list(map(lambda img : addRandomNoiseToSingleImage(img, noiseLevel), allImages)))
+  return numpy.array(list(map(lambda img: addRandomNoiseToSingleImage(img, noiseLevel), allImages)))
+
+
+
+
+def edsr(scale, num_filters=64, num_res_blocks=8, res_block_scaling=None):
+  x_in = Input(shape=(None, None, 3))
+  x = Lambda(normalize, name="normalize")(x_in)
+
+  x = b = Conv2D(num_filters, 3, padding='same')(x)
+  for i in range(num_res_blocks):
+    b = res_block(b, num_filters, res_block_scaling)
+  b = Conv2D(num_filters, 3, padding='same')(b)
+  x = Add()([x, b])
+
+  x = upsample(x, scale, num_filters)
+  x = Conv2D(3, 3, padding='same')(x)
+
+  x = Lambda(denormalize, name="denormalize")(x)
+  return Model(x_in, x, name="edsr")
+
+
+def res_block(x_in, filters, scaling):
+  x = Conv2D(filters, 3, padding='same', activation='relu')(x_in)
+  x = Conv2D(filters, 3, padding='same')(x)
+  if scaling:
+    x = Lambda(lambda t: t * scaling)(x)
+  x = Add()([x_in, x])
+  return x
+
+
+def upsample(x, scale, num_filters):
+  def upsample_1(x, factor, **kwargs):
+    x = Conv2D(num_filters * (factor ** 2), 3, padding='same', **kwargs)(x)
+    return Lambda(pixel_shuffle(scale=factor))(x)
+
+  if scale == 2:
+    x = upsample_1(x, 2, name='conv2d_1_scale_2')
+  elif scale == 3:
+    x = upsample_1(x, 3, name='conv2d_1_scale_3')
+  elif scale == 4:
+    x = upsample_1(x, 2, name='conv2d_1_scale_2')
+    x = upsample_1(x, 2, name='conv2d_2_scale_2')
+
+  return x
+
+
+# ---------------------------------------
+#  Normalization
+# ---------------------------------------
+
+dataset_mean = numpy.array([106.70164812, 93.1222307, 83.21076972])
+
+def normalize(x, rgb_mean=dataset_mean):
+  return (x - rgb_mean) / 127.5
+
+
+def denormalize(x, rgb_mean=dataset_mean):
+  return tf.clip_by_value(
+    x * 127.5 + rgb_mean, 0, 255
+  )
+
+
+
+def pixel_shuffle(scale):
+  return lambda x: tf.nn.depth_to_space(x, scale)
+
+def downscale(image, scale=4):
+  small_img = resize(image, (image.shape[0] / float(scale), image.shape[1] / float(scale)), preserve_range=True)
+  return small_img.astype(numpy.uint8)
+
+def visualizeInputOutput(input, output, real=None, path_to_save=False):
+  rows = 3 if real is not None else 2
+  plt.figure(dpi=200)
+  plt.subplot(1, rows, 1)
+  plt.imshow(input)
+  plt.xticks(())
+  plt.yticks(())
+  plt.subplot(1, rows, 2)
+  plt.imshow(output)
+  plt.xticks(())
+  plt.yticks(())
+  if real is not None:
+    plt.subplot(1, rows, 3)
+    plt.imshow(real)
+    plt.xticks(())
+    plt.yticks(())
+  if(path_to_save):
+    plt.savefig(path_to_save, bbox_inches='tight')
+  plt.show()
+
+def plotAccAndLoss(history, path_to_save=None):
+  acc = history.history['accuracy']
+  val_acc = history.history['val_accuracy']
+
+  loss = history.history['loss']
+  val_loss = history.history['val_loss']
+
+  epochs_range = history.epoch
+
+  plt.figure(figsize=(8, 8))
+  plt.subplot(1, 2, 1)
+  plt.plot(epochs_range, acc, label='Training Accuracy')
+  plt.plot(epochs_range, val_acc, label='Validation Accuracy')
+  plt.legend(loc='lower right')
+  plt.title('Training and Validation Accuracy')
+
+  plt.subplot(1, 2, 2)
+  plt.plot(epochs_range, loss, label='Training Loss')
+  plt.plot(epochs_range, val_loss, label='Validation Loss')
+  plt.legend(loc='upper right')
+  plt.title('Training and Validation Loss')
+  if(path_to_save):
+    plt.savefig(path_to_save, bbox_inches='tight')
+
+  plt.show()
